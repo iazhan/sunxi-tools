@@ -130,6 +130,31 @@ path never consults a chip table.
 ```
 
 
+## Not implemented: write / erase (TODO)
+
+This branch is **read-only by design**: the commands that can modify the flash
+(`spinand-write`, `spinand-erase`) are deliberately absent, so the same binary can be used on a
+device whose flash contents are evidence. Adding them is doable, but the traps below were found
+while surveying the command set (`xfel spinand write/erase` is a working cross-check for the
+sequence):
+
+* **Addresses are page numbers, not byte offsets.** `0xD8 BLOCK ERASE` and `0x10 PROGRAM EXECUTE`
+  carry the page number (`offset / page_size`) in their 24-bit address field. Reusing the
+  byte-offset arithmetic of `spiflash-write` would erase/program the wrong block — `offset` 2048
+  would address page 2048 = block 32, not block 1.
+* **The address width differs per command.** `0x06 WRITE-ENABLE` takes no address, `0x02 PROGRAM
+  LOAD` takes a **2-byte** column address, while `0x10` / `0xD8` take a **3-byte** page address.
+  The read helper here always clocks three address bytes, so it cannot be reused as is.
+* **Waiting takes milliseconds, not microseconds.** `tBERS` (block erase) is ~3–10 ms and `tPROG`
+  ~1 ms — 10–40× the page-read `tR` — so the busy wait has to stay inside the FEL batch engine
+  (the `0xFF 0xFF` marker polls the status register) instead of a host-side `usleep`.
+* **No ECC.** Only the data area is programmed; the spare area (where the ECC bytes live) is left
+  alone. Pages written this way therefore carry no valid ECC and will read back with errors through
+  any ECC engine (Linux MTD, the BROM boot path). Producing an ECC-correct NAND image is a separate
+  problem — upstream `nand-image-builder` targets the older NAND generation.
+* **It cannot be validated without a sacrificial device**: checking "erase → program → read back"
+  means modifying a real chip.
+
 ## Rebasing on newer upstream
 
 The three touch points above are small and independent of the rest of the file, so
