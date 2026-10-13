@@ -28,6 +28,11 @@ void aw_fel_spiflash_write(feldev_handle *dev,
 			   uint32_t offset, void *buf, size_t len,
 			   progress_cb_t progress);
 void aw_fel_spiflash_info(feldev_handle *dev);
+/* --- SPI NAND support (read-only) --- */
+void aw_fel_spinand_read(feldev_handle *dev,
+			 uint32_t offset, void *buf, size_t len,
+			 progress_cb_t progress);
+void aw_fel_spinand_info(feldev_handle *dev);
 void aw_fel_spiflash_help(void);
 void aw_fel_spi0_init(feldev_handle *dev);
 

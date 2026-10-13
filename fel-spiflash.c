@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "fel_lib.h"
 #include "progress.h"
@@ -424,6 +425,124 @@ void aw_fel_spiflash_read(feldev_handle *dev,
 }
 
 /*
+ * ============================================================================
+ * SPI NAND read support
+ *
+ * Why the NOR command set cannot do this: spiflash-read issues a bare 0x03 with
+ * a byte address, but on SPI NAND 0x03 is READ-FROM-CACHE - it never loads a
+ * page, so every offset returns whatever the cache register held after reset.
+ *
+ * SPI NAND needs the two-phase access, which happens to fit this engine's
+ * existing "command + 24-bit address" batch format:
+ *   1. PAGE-READ (0x13) + 24-bit row address. The address value is the page
+ *      number itself (page = offset / page_size), NOT page << 12;
+ *   2. READ-FROM-CACHE (0x03) + the column address inside that page.
+ * Page geometry assumed here: 2048 data bytes + spare. Only the data area is
+ * read (no OOB, no ECC).
+ * ============================================================================
+ */
+#define SPINAND_PAGE_SIZE   2048
+#define SPINAND_CMD_PAGE_READ   0x13
+#define SPINAND_CMD_READ_CACHE  0x03
+
+static void spinand_exec(feldev_handle *dev, uint8_t *cmdbuf, size_t max_chunk,
+			 uint8_t cmd, uint32_t addr, size_t dlen)
+{
+	soc_info_t *soc_info = dev->soc_info;
+	memset(cmdbuf, 0, max_chunk);
+	cmdbuf[0] = (dlen + 4) >> 8;
+	cmdbuf[1] = (dlen + 4) & 0xFF;
+	cmdbuf[2] = cmd;
+	cmdbuf[3] = addr >> 16;
+	cmdbuf[4] = addr >> 8;
+	cmdbuf[5] = addr;
+	aw_fel_write(dev, cmdbuf, soc_info->spl_addr, dlen + 8);
+	aw_fel_remotefunc_execute(dev, NULL);
+}
+
+void aw_fel_spinand_read(feldev_handle *dev,
+			 uint32_t offset, void *buf, size_t len,
+			 progress_cb_t progress)
+{
+	soc_info_t *soc_info = dev->soc_info;
+	void *backup = backup_sram(dev);
+	uint8_t *buf8 = (uint8_t *)buf;
+	size_t max_chunk_size = soc_info->scratch_addr - soc_info->spl_addr;
+	uint8_t *cmdbuf;
+
+	if (max_chunk_size > 0x1000)
+		max_chunk_size = 0x1000;
+	cmdbuf = malloc(max_chunk_size);
+	memset(cmdbuf, 0, max_chunk_size);
+	aw_fel_write(dev, cmdbuf, soc_info->spl_addr, max_chunk_size);
+
+	spi0_init(dev);
+	prepare_spi_batch_data_transfer(dev, soc_info->spl_addr);
+
+	progress_start(progress, len);
+	while (len > 0) {
+		uint32_t page = offset / SPINAND_PAGE_SIZE;
+		size_t col = offset % SPINAND_PAGE_SIZE;
+		size_t chunk = SPINAND_PAGE_SIZE - col;
+
+		if (chunk > len)
+			chunk = len;
+
+		/* 1. load the page into the cache register */
+		spinand_exec(dev, cmdbuf, max_chunk_size,
+			     SPINAND_CMD_PAGE_READ, page, 0);   /* row address = the page number itself */
+		usleep(1000);	/* tR is ~250us max, 1ms leaves margin */
+
+		/* 2. read the data back out of the cache */
+		spinand_exec(dev, cmdbuf, max_chunk_size,
+			     SPINAND_CMD_READ_CACHE, col, chunk);
+		aw_fel_read(dev, soc_info->spl_addr + 6, buf8, chunk);
+
+		len -= chunk;
+		offset += chunk;
+		buf8 += chunk;
+		progress_update(chunk);
+	}
+	free(cmdbuf);
+	restore_sram(dev, backup);
+}
+
+/*
+ * READ ID (0x9F). The engine appends three more bytes (taken as an address), so
+ * the first byte clocked back corresponds to the fourth clock after 0x9F. SPI
+ * NAND repeats its ID on every further byte, hence the raw 8-byte dump to be
+ * read by a human (convention: {vendor, device}).
+ */
+void aw_fel_spinand_info(feldev_handle *dev)
+{
+	soc_info_t *soc_info = dev->soc_info;
+	uint8_t buf[256];
+	size_t n = 8;
+	void *backup = backup_sram(dev);
+	uint8_t *cmdbuf = malloc(soc_info->scratch_addr - soc_info->spl_addr);
+	size_t max_chunk_size = soc_info->scratch_addr - soc_info->spl_addr;
+
+	if (max_chunk_size > 0x1000)
+		max_chunk_size = 0x1000;
+	memset(cmdbuf, 0, max_chunk_size);
+	aw_fel_write(dev, cmdbuf, soc_info->spl_addr, max_chunk_size);
+	spi0_init(dev);
+	prepare_spi_batch_data_transfer(dev, soc_info->spl_addr);
+
+	spinand_exec(dev, cmdbuf, max_chunk_size, 0x9F, 0, n);
+	memset(buf, 0, sizeof(buf));
+	aw_fel_read(dev, soc_info->spl_addr + 6, buf, n);
+
+	printf("SPI NAND raw ID (0x9F) =");
+	for (size_t i = 0; i < n; i++)
+		printf(" %02X", buf[i]);
+	printf("\n");
+
+	free(cmdbuf);
+	restore_sram(dev, backup);
+}
+
+/*
  * Write data to the SPI flash. Use the first 4KiB of SRAM as the data buffer.
  */
 
@@ -602,5 +721,7 @@ void aw_fel_spiflash_help(void)
 {
 	printf("	spiflash-info			Retrieves basic information\n"
 	       "	spiflash-read addr length file	Write SPI flash contents into file\n"
-	       "	spiflash-write addr file	Store file contents into SPI flash\n");
+	       "	spiflash-write addr file	Store file contents into SPI flash\n"
+	       "	spinand-id			Reads SPI NAND raw ID (0x9F)\n"
+	       "	spinand-read addr length file	Write SPI NAND contents into file\n");
 }
